@@ -126,7 +126,6 @@ Resources:
                 RepositoryName: !ImportValue
                   Fn::Sub: ${ProjectName}-ECRRepositoryName
                 ImageTag: "#{variables.IMAGE_TAG}"
-                DetectChanges: 'false'
               OutputArtifacts:
                 - Name: ECRSourceOutput
               RunOrder: 1 # same RunOrder as GitHubSource so both run in parallel
