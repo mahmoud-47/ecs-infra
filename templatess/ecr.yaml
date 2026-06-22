@@ -42,17 +42,6 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
-  # ── GitHub OIDC provider (allows Actions to assume an IAM role without secrets)
-  GitHubOIDCProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: https://token.actions.githubusercontent.com # trust tokens signed by this
-      ClientIdList:
-        - sts.amazonaws.com # restrict these tokens to only be usable for calling AWS's STS
-      ThumbprintList:
-        - 6938fd4d98bab03faadb97b34396831e3780aea1
-        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
-
   # ── IAM role that GitHub Actions assumes via OIDC ─────────────────────────────
   GitHubActionsRole:
     Type: AWS::IAM::Role
@@ -63,7 +52,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Federated: !Ref GitHubOIDCProvider 
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com # ARN is deterministic; provider already exists in account
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
