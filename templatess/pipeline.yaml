@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: CodePipeline (ECR source + CodeDeploy blue/green) and EventBridge trigger
+Description: CodePipeline (S3 source + CodeDeploy blue/green) and EventBridge trigger
 
 Parameters:
   ProjectName:
@@ -17,13 +17,14 @@ Parameters:
 
 Resources:
 
-  # Staging area where pipeline stages exchange files (imageDetail.json, appspec.yaml, taskdef.json)
+  # Receives deployment-bundle.zip (imageDetail.json + appspec.yaml + taskdef.json) from GitHub Actions
+  # and also stores pipeline stage artifacts
   ArtifactBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub ${ProjectName}-pipeline-artifacts-${AWS::AccountId} # account ID ensures global uniqueness
+      BucketName: !Sub ${ProjectName}-pipeline-artifacts-${AWS::AccountId}
       VersioningConfiguration:
-        Status: Enabled # required by CodePipeline to track artifact revisions
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -33,18 +34,19 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true # required for EventBridge to receive S3 Object Created events
       LifecycleConfiguration:
         Rules:
           - Id: ExpireOldArtifacts
             Status: Enabled
-            ExpirationInDays: 30 # auto-delete old pipeline run artifacts to save cost
+            ExpirationInDays: 30
       Tags:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Authorised OAuth link between AWS and GitHub; lets CodePipeline pull files from the app repo without stored secrets
-  # NOTE: after stack creation you must authorise this connection in the
-  #       AWS Console → Developer Tools → Connections before the pipeline runs.
+  # Kept so the GitHub connection in the AWS console is preserved; not used by the pipeline stages
   GitHubConnection:
     Type: AWS::CodeStarConnections::Connection
     Properties:
@@ -59,33 +61,33 @@ Resources:
     Type: AWS::CodeDeploy::Application
     Properties:
       ApplicationName: !Sub ${ProjectName}-app
-      ComputePlatform: ECS # locks this to ECS-specific deployment behaviour; cannot be changed after creation
+      ComputePlatform: ECS
 
-  # Defines how deployments happen: blue/green strategy, traffic shift timing, and which ECS service and ALB listeners to manage
+  # Blue/green strategy: shifts 100 % of traffic at once, rolls back by keeping blue tasks alive 5 min
   CodeDeployDeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
     Properties:
       ApplicationName: !Ref CodeDeployApp
       DeploymentGroupName: !Sub ${ProjectName}-dg
       ServiceRoleArn: !GetAtt CodeDeployRole.Arn
-      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce # shifts 100% of traffic in one step
+      DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
       DeploymentStyle:
-        DeploymentOption: WITH_TRAFFIC_CONTROL # ALB listener rules handle the traffic shift
+        DeploymentOption: WITH_TRAFFIC_CONTROL
         DeploymentType: BLUE_GREEN
       BlueGreenDeploymentConfiguration:
         DeploymentReadyOption:
-          ActionOnTimeout: CONTINUE_DEPLOYMENT # shift traffic immediately, no manual approval
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
           WaitTimeInMinutes: 0
         TerminateBlueInstancesOnDeploymentSuccess:
           Action: TERMINATE
-          TerminationWaitTimeInMinutes: 5 # keeps blue tasks alive for 5 min as a rollback window
+          TerminationWaitTimeInMinutes: 5
       LoadBalancerInfo:
         TargetGroupPairInfoList:
-          - ProdTrafficRoute: # listener serving real user traffic (port 80)
+          - ProdTrafficRoute:
               ListenerArns:
                 - !ImportValue
                     Fn::Sub: ${ProjectName}-ProductionListenerArn
-            TestTrafficRoute: # listener used to validate green before traffic shifts (port 8080)
+            TestTrafficRoute:
               ListenerArns:
                 - !ImportValue
                     Fn::Sub: ${ProjectName}-TestListenerArn
@@ -98,54 +100,35 @@ Resources:
           ServiceName: !ImportValue
             Fn::Sub: ${ProjectName}-ECSServiceName
 
-  # Orchestrates the full flow: pulls the new image and deployment files, then hands off to CodeDeploy
+  # Reads the deployment bundle uploaded to S3 and drives CodeDeploy blue/green
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
       Name: !Sub ${ProjectName}-pipeline
       RoleArn: !GetAtt PipelineRole.Arn
-      Variables:
-        - Name: IMAGE_TAG
-          Description: ECR image SHA tag captured from the EventBridge push event
       ArtifactStore:
         Type: S3
         Location: !Ref ArtifactBucket
-      PipelineType: V2 # V2 required for ECR as a native source action
+      PipelineType: V2
       Stages:
-        # Source 1: ECR image push → imageDetail.json
-        # Source 2: GitHub app repo → appspec.yaml + taskdef.json
+        # GitHub Actions builds the image, writes imageDetail.json with the SHA URI, zips everything,
+        # and uploads to S3 — that upload triggers EventBridge which starts this pipeline
         - Name: Source
           Actions:
-            - Name: ECRSource
+            - Name: S3Source
               ActionTypeId:
                 Category: Source
                 Owner: AWS
-                Provider: ECR
+                Provider: S3
                 Version: '1'
               Configuration:
-                RepositoryName: !ImportValue
-                  Fn::Sub: ${ProjectName}-ECRRepositoryName
-                ImageTag: "#{variables.IMAGE_TAG}"
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: deployment-bundle.zip
+                PollForSourceChanges: 'false' # EventBridge handles the trigger; polling is disabled
               OutputArtifacts:
-                - Name: ECRSourceOutput
-              RunOrder: 1 # same RunOrder as GitHubSource so both run in parallel
-
-            - Name: GitHubSource
-              ActionTypeId:
-                Category: Source
-                Owner: AWS
-                Provider: CodeStarSourceConnection
-                Version: '1'
-              Configuration:
-                ConnectionArn: !Ref GitHubConnection
-                FullRepositoryId: !Sub ${GitHubOrg}/${GitHubAppRepo}
-                BranchName: !Ref GitHubBranch
-                DetectChanges: 'false' # pipeline must only trigger from ECR pushes, not GitHub commits
-              OutputArtifacts:
-                - Name: GitHubSourceOutput
+                - Name: DeploymentBundle
               RunOrder: 1
 
-        # Deploy via CodeDeploy ECS blue/green
         - Name: Deploy
           Actions:
             - Name: BlueGreenDeploy
@@ -157,51 +140,45 @@ Resources:
               Configuration:
                 ApplicationName: !Ref CodeDeployApp
                 DeploymentGroupName: !Ref CodeDeployDeploymentGroup
-                TaskDefinitionTemplateArtifact: GitHubSourceOutput
+                TaskDefinitionTemplateArtifact: DeploymentBundle
                 TaskDefinitionTemplatePath: taskdef.json
-                AppSpecTemplateArtifact: GitHubSourceOutput
+                AppSpecTemplateArtifact: DeploymentBundle
                 AppSpecTemplatePath: appspec.yaml
-                Image1ArtifactName: ECRSourceOutput
-                Image1ContainerName: IMAGE1_NAME # placeholder in taskdef.json replaced with the real image URI
+                Image1ArtifactName: DeploymentBundle
+                Image1ContainerName: IMAGE1_NAME # matches <IMAGE1_NAME> placeholder in taskdef.json
               InputArtifacts:
-                - Name: ECRSourceOutput
-                - Name: GitHubSourceOutput
+                - Name: DeploymentBundle
               RunOrder: 1
 
       Tags:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Watches ECR for new image pushes and automatically fires the pipeline; removes the need for manual triggers
-  ECRPushEventRule:
+  # Fires the pipeline whenever deployment-bundle.zip lands in the artifact bucket
+  S3DeployTrigger:
     Type: AWS::Events::Rule
     Properties:
-      Name: !Sub ${ProjectName}-ecr-push-trigger
-      Description: Trigger CodePipeline when a new image is pushed to ECR
+      Name: !Sub ${ProjectName}-s3-deploy-trigger
+      Description: Trigger CodePipeline when deployment-bundle.zip is uploaded to the artifact bucket
       EventPattern:
         source:
-          - aws.ecr
+          - aws.s3
         detail-type:
-          - ECR Image Action
+          - Object Created
         detail:
-          action-type:
-            - PUSH
-          result:
-            - SUCCESS # ignore failed or partial pushes
-          repository-name:
-            - !ImportValue
-                Fn::Sub: ${ProjectName}-ECRRepositoryName
+          bucket:
+            name:
+              - !Ref ArtifactBucket
+          object:
+            key:
+              - deployment-bundle.zip
       State: ENABLED
       Targets:
         - Id: StartPipeline
           Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
           RoleArn: !GetAtt EventBridgeRole.Arn
-          InputTransformer:
-            InputPathsMap:
-              imageTag: "$.detail.image-tag"
-            InputTemplate: '{"variables":[{"name":"IMAGE_TAG","value":"<imageTag>"}]}'
 
-  # Grants CodePipeline the permissions it needs to read artifacts, pull from GitHub, and trigger CodeDeploy
+  # Grants CodePipeline the permissions it needs to read artifacts and trigger CodeDeploy
   PipelineRole:
     Type: AWS::IAM::Role
     Properties:
@@ -221,21 +198,13 @@ Resources:
               - Effect: Allow
                 Action:
                   - s3:GetObject
+                  - s3:GetObjectVersion
                   - s3:PutObject
                   - s3:GetBucketVersioning
                   - s3:ListBucket
                 Resource:
                   - !GetAtt ArtifactBucket.Arn
                   - !Sub ${ArtifactBucket.Arn}/*
-              - Effect: Allow
-                Action:
-                  - ecr:DescribeImages
-                  - ecr:GetAuthorizationToken
-                Resource: '*' # GetAuthorizationToken does not support resource-level scoping
-              - Effect: Allow
-                Action:
-                  - codestar-connections:UseConnection
-                Resource: !Ref GitHubConnection
               - Effect: Allow
                 Action:
                   - codedeploy:CreateDeployment
@@ -252,7 +221,7 @@ Resources:
                 Resource: '*'
               - Effect: Allow
                 Action:
-                  - iam:PassRole # required to attach IAM roles when registering a new task definition
+                  - iam:PassRole
                 Resource:
                   - !ImportValue
                       Fn::Sub: ${ProjectName}-TaskDefinitionArn
@@ -275,12 +244,12 @@ Resources:
               Service: codedeploy.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS # AWS-managed policy covering all ECS blue/green permissions
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
       Tags:
         - Key: Project
           Value: !Ref ProjectName
 
-  # Grants EventBridge the single permission it needs to start the pipeline when an ECR event matches
+  # Grants EventBridge the single permission it needs to start the pipeline when the S3 bundle lands
   EventBridgeRole:
     Type: AWS::IAM::Role
     Properties:
@@ -299,7 +268,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: codepipeline:StartPipelineExecution
-                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline} # scoped to this pipeline only
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
       Tags:
         - Key: Project
           Value: !Ref ProjectName
