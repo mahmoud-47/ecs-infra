@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECS Fargate cluster, ALB, service (blue/green ready), and auto-scaling
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ecs-cicd
+  ContainerPort:
+    Type: Number
+    Default: 8080
+  TaskCpu:
+    Type: String
+    Default: '256'
+  TaskMemory:
+    Type: String
+    Default: '512'
+
+Resources:
+  # ── CloudWatch log group ──────────────────────────────────────────────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${ProjectName}
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── ECS cluster ───────────────────────────────────────────────────────────────
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ProjectName}-cluster
+      ClusterSettings: # turns on enhanced CloudWatch metrics
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Task execution role (grants ECS agent access to ECR and CW Logs) ─────────
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com # ← only ECS can assume this
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Task role (application-level permissions) ─────────────────────────────────
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Initial task definition (bootstrap; CodeDeploy updates this later) ────────
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-app
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc # each task gets its own dedicated network interface (ENI) with its own private IP
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub
+            - ${ECRUri}:latest
+            - ECRUri: !ImportValue
+                Fn::Sub: ${ProjectName}-ECRRepositoryUri
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort # for Lb
+              Protocol: tcp
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub curl -f http://localhost:${ContainerPort}/actuator/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Application Load Balancer ─────────────────────────────────────────────────
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${ProjectName}-alb
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue
+            Fn::Sub: ${ProjectName}-PublicSubnet1
+        - !ImportValue
+            Fn::Sub: ${ProjectName}-PublicSubnet2
+      SecurityGroups:
+        - !ImportValue
+            Fn::Sub: ${ProjectName}-ALBSecurityGroupId
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Blue target group (production traffic)
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-blue-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Green target group (used during blue/green deployments)
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${ProjectName}-green-tg
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: ${ProjectName}-VpcId
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Production listener (port 80 → blue target group)
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+
+  # Test listener (port 8080 → green target group, used during deployments)
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTargetGroup
+
+  # ── ECS Service (CODE_DEPLOY controller for blue/green) ───────────────────────
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ProductionListener
+      - TestListener
+    Properties:
+      ServiceName: !Sub ${ProjectName}-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+                Fn::Sub: ${ProjectName}-PrivateSubnet1
+            - !ImportValue
+                Fn::Sub: ${ProjectName}-PrivateSubnet2
+          SecurityGroups:
+            - !ImportValue
+                Fn::Sub: ${ProjectName}-ECSTaskSecurityGroupId
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref BlueTargetGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── Auto Scaling ──────────────────────────────────────────────────────────────
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 1
+      MaxCapacity: 4
+      ResourceId: !Sub service/${ECSCluster}/${ECSService.Name}
+      ScalableDimension: ecs:service:DesiredCount # what is being scaled
+      ServiceNamespace: ecs
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+
+  ScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${ProjectName}-cpu-scale-out
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 60.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+Outputs:
+  ECSClusterName:
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub ${ProjectName}-ECSClusterName
+
+  ECSServiceName:
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub ${ProjectName}-ECSServiceName
+
+  ALBDnsName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${ProjectName}-ALBDnsName
+
+  ALBArn:
+    Value: !Ref ALB
+    Export:
+      Name: !Sub ${ProjectName}-ALBArn
+
+  BlueTargetGroupArn:
+    Value: !Ref BlueTargetGroup
+    Export:
+      Name: !Sub ${ProjectName}-BlueTargetGroupArn
+
+  GreenTargetGroupArn:
+    Value: !Ref GreenTargetGroup
+    Export:
+      Name: !Sub ${ProjectName}-GreenTargetGroupArn
+
+  ProductionListenerArn:
+    Value: !Ref ProductionListener
+    Export:
+      Name: !Sub ${ProjectName}-ProductionListenerArn
+
+  TestListenerArn:
+    Value: !Ref TestListener
+    Export:
+      Name: !Sub ${ProjectName}-TestListenerArn
+
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub ${ProjectName}-TaskDefinitionArn

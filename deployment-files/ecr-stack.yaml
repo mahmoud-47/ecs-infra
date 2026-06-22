@@ -1,0 +1,10 @@
+# Creates the ECR repository and GitHub OIDC integration.
+# Replace GitHubOrg and GitHubRepo with your actual values.
+template-file-path: templatess/ecr.yaml
+parameters:
+  ProjectName: ecs-cicd
+  GitHubOrg: mahmoud-47
+  GitHubRepo: ecs-spring-boot-app
+tags:
+  Project: ecs-cicd
+  ManagedBy: CloudFormation-GitSync

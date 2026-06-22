@@ -1,0 +1,8 @@
+# Depends on vpc-stack exports.
+template-file-path: templatess/security.yaml
+parameters:
+  ProjectName: ecs-cicd
+  ContainerPort: '8080'
+tags:
+  Project: ecs-cicd
+  ManagedBy: CloudFormation-GitSync

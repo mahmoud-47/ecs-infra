@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECR repository with immutable tags and lifecycle policy
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ecs-cicd
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or username that owns the application repo
+  GitHubRepo:
+    Type: String
+    Description: Application repository name (app code repo)
+
+Resources:
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub ${ProjectName}/app
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ecr
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── GitHub OIDC provider (allows Actions to assume an IAM role without secrets)
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com # trust tokens signed by this
+      ClientIdList:
+        - sts.amazonaws.com # restrict these tokens to only be usable for calling AWS's STS
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ── IAM role that GitHub Actions assumes via OIDC ─────────────────────────────
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-github-actions-role
+      AssumeRolePolicyDocument: # Only entities authenticating via that GitHub OIDC provider can assume this role
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider 
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+      Policies:
+        - PolicyName: ECRPushPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability  # Check if layers already exist before uploading
+                  - ecr:GetDownloadUrlForLayer       # Get URL to download an image layer
+                  - ecr:GetRepositoryPolicy          # Read the repo's resource policy
+                  - ecr:DescribeRepositories         # Get repo metadata (URI, ARN, etc.)
+                  - ecr:ListImages                   # List image tags/digests in the repo
+                  - ecr:DescribeImages               # Get details about specific images
+                  - ecr:BatchGetImage                # Fetch an image's manifest (pull)
+                  - ecr:InitiateLayerUpload          # Start uploading a new image layer
+                  - ecr:UploadLayerPart              # Upload a chunk of layer data
+                  - ecr:CompleteLayerUpload          # Finalize an uploaded layer
+                  - ecr:PutImage                     # Publish the image tag/manifest (push)
+                Resource: !GetAtt ECRRepository.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetBucketVersioning
+                Resource: # CodePipeline artifact bucket
+                  - !Sub arn:aws:s3:::${ProjectName}-pipeline-artifacts-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::${ProjectName}-pipeline-artifacts-${AWS::AccountId}/*
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  ECRRepositoryUri:
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub ${ProjectName}-ECRRepositoryUri
+
+  ECRRepositoryArn:
+    Value: !GetAtt ECRRepository.Arn
+    Export:
+      Name: !Sub ${ProjectName}-ECRRepositoryArn
+
+  ECRRepositoryName:
+    Value: !Ref ECRRepository
+    Export:
+      Name: !Sub ${ProjectName}-ECRRepositoryName
+
+  GitHubActionsRoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+    Export:
+      Name: !Sub ${ProjectName}-GitHubActionsRoleArn

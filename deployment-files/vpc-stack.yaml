@@ -1,0 +1,9 @@
+# CloudFormation GitSync deployment file for the VPC stack.
+# Connect this repository to a CloudFormation stack and point it at this file.
+template-file-path: templatess/vpc.yaml
+parameters:
+  ProjectName: ecs-cicd
+  VpcCidr: 10.0.0.0/16
+tags:
+  Project: ecs-cicd
+  ManagedBy: CloudFormation-GitSync

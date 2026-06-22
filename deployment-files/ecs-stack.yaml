@@ -1,0 +1,10 @@
+# Depends on vpc-stack, security-stack, and ecr-stack exports.
+template-file-path: templatess/ecs.yaml
+parameters:
+  ProjectName: ecs-cicd
+  ContainerPort: '8080'
+  TaskCpu: '256'
+  TaskMemory: '512'
+tags:
+  Project: ecs-cicd
+  ManagedBy: CloudFormation-GitSync

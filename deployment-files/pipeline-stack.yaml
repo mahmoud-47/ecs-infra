@@ -1,0 +1,12 @@
+# Depends on vpc-stack, ecr-stack, and ecs-stack exports.
+# Replace GitHubOrg and GitHubAppRepo with your actual values.
+template-file-path: templatess/pipeline.yaml
+parameters:
+  ProjectName: ecs-cicd
+  GitHubOrg: mahmoud-47
+  GitHubAppRepo: ecs-spring-boot-app
+  GitHubBranch: main
+  ImageTag: latest
+tags:
+  Project: ecs-cicd
+  ManagedBy: CloudFormation-GitSync
