@@ -6,7 +6,6 @@ parameters:
   GitHubOrg: mahmoud-47
   GitHubAppRepo: ecs-spring-boot-app
   GitHubBranch: main
-  ImageTag: latest
 tags:
   Project: ecs-cicd
   ManagedBy: CloudFormation-GitSync

@@ -14,10 +14,6 @@ Parameters:
   GitHubBranch:
     Type: String
     Default: main
-  ImageTag:
-    Type: String
-    Default: latest # must match the tag your GitHub Actions workflow pushes
-    Description: ECR image tag that triggers the pipeline
 
 Resources:
 
@@ -108,6 +104,9 @@ Resources:
     Properties:
       Name: !Sub ${ProjectName}-pipeline
       RoleArn: !GetAtt PipelineRole.Arn
+      Variables:
+        - Name: IMAGE_TAG
+          Description: ECR image SHA tag captured from the EventBridge push event
       ArtifactStore:
         Type: S3
         Location: !Ref ArtifactBucket
@@ -126,7 +125,8 @@ Resources:
               Configuration:
                 RepositoryName: !ImportValue
                   Fn::Sub: ${ProjectName}-ECRRepositoryName
-                ImageTag: !Ref ImageTag
+                ImageTag: "#{variables.IMAGE_TAG}"
+                DetectChanges: 'false'
               OutputArtifacts:
                 - Name: ECRSourceOutput
               RunOrder: 1 # same RunOrder as GitHubSource so both run in parallel
@@ -192,13 +192,15 @@ Resources:
           repository-name:
             - !ImportValue
                 Fn::Sub: ${ProjectName}-ECRRepositoryName
-          image-tag:
-            - !Ref ImageTag
       State: ENABLED
       Targets:
         - Id: StartPipeline
           Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
           RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              imageTag: "$.detail.image-tag"
+            InputTemplate: '{"variables":[{"name":"IMAGE_TAG","value":"<imageTag>"}]}'
 
   # Grants CodePipeline the permissions it needs to read artifacts, pull from GitHub, and trigger CodeDeploy
   PipelineRole:
