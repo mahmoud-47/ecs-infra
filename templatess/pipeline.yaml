@@ -129,6 +129,22 @@ Resources:
                 - Name: DeploymentBundle
               RunOrder: 1
 
+        - Name: Build
+          Actions:
+            - Name: SubstitutePlaceholders
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: DeploymentBundle
+              OutputArtifacts:
+                - Name: SubstitutedBundle
+              RunOrder: 1
+
         - Name: Deploy
           Actions:
             - Name: BlueGreenDeploy
@@ -140,16 +156,91 @@ Resources:
               Configuration:
                 ApplicationName: !Ref CodeDeployApp
                 DeploymentGroupName: !Ref CodeDeployDeploymentGroup
-                TaskDefinitionTemplateArtifact: DeploymentBundle
+                TaskDefinitionTemplateArtifact: SubstitutedBundle
                 TaskDefinitionTemplatePath: taskdef.json
-                AppSpecTemplateArtifact: DeploymentBundle
+                AppSpecTemplateArtifact: SubstitutedBundle
                 AppSpecTemplatePath: appspec.yaml
-                Image1ArtifactName: DeploymentBundle
-                Image1ContainerName: IMAGE1_NAME # matches <IMAGE1_NAME> placeholder in taskdef.json
+                Image1ArtifactName: SubstitutedBundle
+                Image1ContainerName: IMAGE1_NAME
               InputArtifacts:
-                - Name: DeploymentBundle
+                - Name: SubstitutedBundle
               RunOrder: 1
 
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Substitutes taskdef.json placeholders with values from SSM before CodeDeploy runs
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource: !Sub ${ArtifactBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}-substitute:*
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-substitute
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - EXECUTION_ROLE_ARN=$(aws ssm get-parameter --name /${PROJECT_NAME}/execution-role-arn --query Parameter.Value --output text)
+                - TASK_ROLE_ARN=$(aws ssm get-parameter --name /${PROJECT_NAME}/task-role-arn --query Parameter.Value --output text)
+                - LOG_GROUP=$(aws ssm get-parameter --name /${PROJECT_NAME}/log-group --query Parameter.Value --output text)
+                - REGION=$(aws ssm get-parameter --name /${PROJECT_NAME}/region --query Parameter.Value --output text)
+                - sed -i "s|<EXECUTION_ROLE_ARN>|${EXECUTION_ROLE_ARN}|g" taskdef.json
+                - sed -i "s|<TASK_ROLE_ARN>|${TASK_ROLE_ARN}|g" taskdef.json
+                - sed -i "s|<LOG_GROUP>|${LOG_GROUP}|g" taskdef.json
+                - sed -i "s|<AWS_REGION>|${REGION}|g" taskdef.json
+          artifacts:
+            files:
+              - taskdef.json
+              - appspec.yaml
+              - imageDetail.json
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -219,6 +310,11 @@ Resources:
                   - ecs:RegisterTaskDefinition
                   - ecs:DescribeTaskDefinition
                 Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CodeBuildProject.Arn
               - Effect: Allow
                 Action:
                   - iam:PassRole

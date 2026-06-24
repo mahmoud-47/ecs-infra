@@ -224,6 +224,35 @@ Resources:
         - Key: Project
           Value: !Ref ProjectName
 
+  # ── SSM Parameters (config values GitHub Actions reads at deploy time) ───────
+  ExecutionRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/execution-role-arn
+      Type: String
+      Value: !GetAtt TaskExecutionRole.Arn
+
+  TaskRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/task-role-arn
+      Type: String
+      Value: !GetAtt TaskRole.Arn
+
+  LogGroupParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/log-group
+      Type: String
+      Value: !Ref LogGroup
+
+  RegionParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/region
+      Type: String
+      Value: !Ref AWS::Region
+
   # ── Auto Scaling ──────────────────────────────────────────────────────────────
   AutoScalingTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
